@@ -10,6 +10,7 @@ from typing import Any, Callable, List
 
 import graphviz
 import networkx as nx
+import pandas as pd
 from littleutils import strip_required_prefix, strip_required_suffix
 
 from fn_graph.calculation import NodeInstruction, get_execution_instructions
@@ -46,6 +47,8 @@ class Composer:
         _tests=None,
         _source_map=None,
     ):
+        self.data_shapes = dict()
+
         # These are namespaced
         self._functions = _functions or {}
         self._tests = _tests or {}
@@ -286,6 +289,20 @@ class Composer:
     def calculate(
         self, outputs, perform_checks=True, intermediates=False, progress_callback=None
     ):
+        def default_callback(message_type, message):
+            if message_type == 'start_step':
+                name = message['name']
+                params = self.get_step_parameters(name)
+                log.info(f"Step {name} Parameters: {params}")
+            elif message_type == 'end_step':
+                name = message['name']
+                result = message['result']
+                if type(result) == pd.DataFrame:
+                    log.info(f"Step {name} Data Shape: {result.shape}")
+                    self.data_shapes[name] = result.shape
+
+        progress_callback = progress_callback or default_callback
+
         return calculate(
             self, outputs, perform_checks, intermediates, progress_callback
         )
@@ -472,6 +489,9 @@ class Composer:
         highlight=None,
         filter=None,
         extra_node_styles=None,
+        label_sep=" ",
+        rankdir="TB",
+        node_width_inches="3.5",
     ):
         """
         Generates a graphviz.DiGraph that is suitable for display.
@@ -480,7 +500,7 @@ class Composer:
 
         The output can be directly viewed in a Jupyter notebook.
         """
-        extra_node_styles = extra_node_styles or {}
+        extra_node_styles = extra_node_styles or self.get_default_styles(node_width_inches)
         highlight = highlight or []
         dag = self.dag()
 
@@ -541,7 +561,11 @@ class Composer:
                     elif flatten:
                         label = name.replace("_", "\n")
                     else:
-                        label = k.replace("_", "\n")
+                        label = k.replace("_", label_sep)
+
+                        if k in self.data_shapes:
+                            n = self.data_shapes[k][0]
+                            label += f"\n\n(n={n:,})"
 
                     if name in filter:
                         g.node(name, label=label, **node_styles)
@@ -550,7 +574,7 @@ class Composer:
             return g
 
         result = create_subgraph(self._build_name_tree())
-        result.attr("graph", rankdir="BT")
+        result.attr("graph", rankdir=rankdir)
         for node in self.dag().nodes():
             for _, pred in self._resolve_predecessors(node):
                 if (not hide_parameters or pred not in self._parameters) and (
@@ -669,3 +693,57 @@ class Composer:
                     yield key, resolved_name
             else:
                 yield from self._resolve_var_predecessors(fname, key)
+
+    def get_parameter_names(self):
+        """Return names of parameters"""
+        return list(self._unbound().keys()) + \
+            list(self.parameters().keys())
+
+    def get_step_names(self):
+        """Return names of steps"""
+        parameter_names = self.get_parameter_names()
+        return [k for k in self.functions().keys() if k not in parameter_names]
+
+    def get_step_parameters(self, step_name):
+        """Return DICT of {PARAMETER NAME: PARAMETER VALUE} for the step"""
+        signature = inspect.signature(self.functions()[step_name])
+        parameters = {}
+        for k, v in signature.parameters.items():
+            if k in self.parameters():
+                parameters[k] = self.parameters()[k][1]
+            elif v.default != v.empty:
+                parameters[k] = v.default
+        return parameters
+
+    def get_default_styles(self, node_width_inches="3.5"):
+        """Return custom styles for flowchart nodes"""
+        step_styles = {
+            'fillcolor': '#588B8B',
+            'color': '#588B8B',
+            'fontcolor': '#FCFFF5',
+            'fontsize': '10',
+            'fontname': 'Arial',
+            'penwidth': '1',
+            'width': node_width_inches}
+
+        param_styles = {
+            'fillcolor': '#F28F3B',
+            'color': '#F28F3B',
+            'fontcolor': '#FCFFF5',
+            'fontsize': '10',
+            'fontname': 'Arial',
+            'penwidth': '1',
+            'width': node_width_inches}
+
+        styles_steps = {k: step_styles for k in self.get_step_names()}
+        styles_params = {k: param_styles for k in self.get_parameter_names()}
+
+        return {**styles_steps, **styles_params}
+
+    def describe(self):
+        """Return DF of Step Name + Parameter Values"""
+        rows = []
+        for name in self.get_step_names():
+            row = {'Step': name, 'Parameters': self.get_step_parameters(name)}
+            rows.append(row)
+        return pd.DataFrame(rows).set_index('Step')
